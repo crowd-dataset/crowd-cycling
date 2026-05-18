@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 from moviepy.video.io.VideoFileClip import VideoFileClip  # type: ignore
 import requests
 import os
+import subprocess
 import common
 import pathlib
 from bs4 import BeautifulSoup
@@ -38,9 +39,27 @@ logger = CustomLogger(__name__)  # use custom logger
 # USER PARAMETERS (edit these variables; no argparse / no CLI parser is used)
 # -----------------------------------------------------------------------------
 def _cfg_bool(key: str, default: bool) -> bool:
-    """Best-effort boolean config lookup with a safe fallback."""
+    """Best-effort boolean config lookup with a safe fallback.
+
+    Handles real booleans from JSON as well as string values such as
+    "true"/"false", "yes"/"no", and "1"/"0".
+    """
     try:
-        return bool(common.get_configs(key))
+        v = common.get_configs(key)
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in {"true", "1", "yes", "y", "on"}:
+                return True
+            if s in {"false", "0", "no", "n", "off", ""}:
+                return False
+            return default
+        if isinstance(v, (int, float)):
+            return bool(v)
+        return default
     except Exception:
         return default
 
@@ -83,6 +102,10 @@ TRIMMED_CLIPS_DIR = os.path.join(videos_dir, "trimmed_video")
 # If True, keep the intermediate trimmed clip on disk. If False, it will be deleted
 # after the annotated video is written successfully.
 KEEP_TRIMMED_CLIP: bool = _cfg_bool("KEEP_TRIMMED_CLIP", False)
+
+# If True, delete the full downloaded source video after all annotation jobs for a CSV
+# finish or fail. This only deletes files inside DOWNLOADED_VIDEOS_DIR.
+DELETE_DOWNLOADED_VIDEO_ON_COMPLETE: bool = _cfg_bool("DELETE_DOWNLOADED_VIDEO_ON_COMPLETE", False)
 
 # Annotation controls
 # If True, always draw IDs for ALL detected bicyclists (not only those involved in following episodes).
@@ -390,16 +413,401 @@ class Analysis():
             return None
 
     @staticmethod
+    def _parse_fps_fraction(value: str) -> Optional[float]:
+        """Parse ffprobe frame-rate strings such as '30000/1001' or '29.97'."""
+        try:
+            text = str(value).strip()
+            if not text or text == "0/0":
+                return None
+            if "/" in text:
+                num_s, den_s = text.split("/", 1)
+                num = float(num_s)
+                den = float(den_s)
+                if den == 0:
+                    return None
+                fps = num / den
+            else:
+                fps = float(text)
+            if fps > 0:
+                return float(fps)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def get_video_fps(video_path: str) -> float:
-        """Return FPS for a local video file (OpenCV)."""
+        """Return FPS for a local video file.
+
+        Prefer ffprobe's avg_frame_rate because it preserves values such as
+        30000/1001 = 29.970... that are often rounded to 30 elsewhere. Fall
+        back to OpenCV when ffprobe is unavailable.
+        """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
+
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    fps = Analysis._parse_fps_fraction(line)
+                    if fps is not None and fps > 0:
+                        return fps
+        except Exception:
+            pass
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         cap.release()
         return fps
+
+    @staticmethod
+    def infer_frame_count_base(df: pl.DataFrame) -> int:
+        """Infer whether CSV frame-count is zero-based or one-based.
+
+        The YOLO CSVs in this project normally start at 1, meaning CSV frame 1
+        corresponds to the first video frame of the mapped segment. This helper
+        keeps the code safe if an older zero-based CSV appears.
+        """
+        try:
+            if df.height == 0 or "frame-count" not in df.columns:
+                return 1
+            min_frame = int(df.select(pl.min("frame-count")).item())
+            return 0 if min_frame == 0 else 1
+        except Exception:
+            return 1
+
+    @staticmethod
+    def csv_frame_start_seconds(
+        segment_start_seconds: float,
+        csv_frame: int,
+        fps: float,
+        frame_count_base: int,
+    ) -> float:
+        """Map a CSV frame-count to the source-video timestamp at that frame start."""
+        if float(fps) <= 0:
+            raise ValueError("fps must be positive when converting frame-count to seconds.")
+        return float(segment_start_seconds) + (float(int(csv_frame) - int(frame_count_base)) / float(fps))
+
+    @staticmethod
+    def csv_frame_end_seconds(
+        segment_start_seconds: float,
+        csv_frame: int,
+        fps: float,
+        frame_count_base: int,
+    ) -> float:
+        """Map an inclusive CSV frame-count to the exclusive source-video end timestamp."""
+        if float(fps) <= 0:
+            raise ValueError("fps must be positive when converting frame-count to seconds.")
+        return float(segment_start_seconds) + (float(int(csv_frame) - int(frame_count_base) + 1) / float(fps))
+
+    def _prepare_annotation_data(
+        self,
+        *,
+        df: pl.DataFrame,
+        cyclist_map: pl.DataFrame,
+        episodes: pl.DataFrame,
+        involved_cyclist_ids: set[int],
+        draw_all_bicyclists: bool,
+    ):
+        """Prepare frame-indexed rows and role lookup for annotation drawing."""
+        required_df_cols = {"frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"}
+        missing_df_cols = required_df_cols - set(df.columns)
+        if missing_df_cols:
+            raise ValueError(f"df is missing required columns: {sorted(missing_df_cols)}")
+
+        has_cyclist_map = cyclist_map is not None and cyclist_map.height > 0
+        cyclist_map_has_cols = has_cyclist_map and {"cyclist_id", "bicycle_id"}.issubset(set(cyclist_map.columns))
+
+        cyclist_ids: set[int] = set()
+        if draw_all_bicyclists and cyclist_map_has_cols:
+            cyclist_ids |= set(map(int, cyclist_map.get_column("cyclist_id").to_list()))
+        if involved_cyclist_ids:
+            cyclist_ids |= set(map(int, involved_cyclist_ids))
+        if not cyclist_ids and cyclist_map_has_cols:
+            cyclist_ids = set(map(int, cyclist_map.get_column("cyclist_id").to_list()))
+
+        bicycle_ids: set[int] = set()
+        if cyclist_ids and cyclist_map_has_cols:
+            bicycle_ids = set(
+                map(
+                    int,
+                    cyclist_map.filter(pl.col("cyclist_id").is_in(list(cyclist_ids)))
+                    .get_column("bicycle_id")
+                    .to_list(),
+                )
+            )
+
+        bike_to_cyclist: dict[int, int] = {}
+        if cyclist_map_has_cols:
+            for r in cyclist_map.select(["bicycle_id", "cyclist_id"]).iter_rows(named=True):
+                try:
+                    bike_to_cyclist[int(r["bicycle_id"])] = int(r["cyclist_id"])
+                except Exception:
+                    continue
+
+        leader_col: Optional[str] = None
+        if episodes is not None and episodes.height > 0:
+            if "leader_id" in episodes.columns:
+                leader_col = "leader_id"
+            elif "following_id" in episodes.columns:
+                leader_col = "following_id"
+
+        intervals: list[tuple[int, int, int, int]] = []
+        if leader_col is not None:
+            needed = {"start_frame", "end_frame", "follower_id", leader_col}
+            missing = needed - set(episodes.columns)
+            if missing:
+                raise ValueError(f"episodes is missing required columns for roles: {sorted(missing)}")
+
+            for r in episodes.select(["start_frame", "end_frame", "follower_id", leader_col]).iter_rows(named=True):
+                intervals.append(
+                    (
+                        int(r["start_frame"]),
+                        int(r["end_frame"]),
+                        int(r["follower_id"]),
+                        int(r[leader_col]),
+                    )
+                )
+
+        def roles_for_frame(frame_count: int) -> tuple[dict[int, str], dict[int, int]]:
+            roles: dict[int, str] = {}
+            active_pairs: dict[int, int] = {}
+            for s, e, fid, lid in intervals:
+                if s <= frame_count <= e:
+                    roles[fid] = "follower"
+                    roles[lid] = "leader"
+                    active_pairs[fid] = lid
+            return roles, active_pairs
+
+        frame_to_rows: dict[int, list[dict]] = {}
+        if df.height > 0 and (cyclist_ids or bicycle_ids):
+            wanted = (
+                df.filter(
+                    ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
+                    ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+                )
+                .select(["frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"])
+            )
+            for row in wanted.iter_rows(named=True):
+                fc = int(row["frame-count"])
+                frame_to_rows.setdefault(fc, []).append(row)
+
+        return frame_to_rows, roles_for_frame, bike_to_cyclist
+
+    @staticmethod
+    def _draw_annotation_frame(
+        *,
+        frame,
+        csv_frame: int,
+        frame_to_rows: dict[int, list[dict]],
+        roles_for_frame,
+        bike_to_cyclist: dict[int, int],
+        draw_pair_overlay: bool,
+        draw_labels: bool,
+    ):
+        """Draw annotations for one CSV frame-count on an already decoded image."""
+        height, width = frame.shape[:2]
+        coords_normalised = True
+        roles, active_pairs = roles_for_frame(int(csv_frame))
+
+        for row in frame_to_rows.get(int(csv_frame), []):
+            yolo_id = int(row["yolo-id"])
+            obj_id = int(row["unique-id"])
+
+            xc = float(row["x-center"])
+            yc = float(row["y-center"])
+            w = float(row["width"])
+            h = float(row["height"])
+
+            if coords_normalised:
+                xc *= width
+                yc *= height
+                w *= width
+                h *= height
+
+            x1 = int(round(xc - w / 2.0))
+            y1 = int(round(yc - h / 2.0))
+            x2 = int(round(xc + w / 2.0))
+            y2 = int(round(yc + h / 2.0))
+
+            x1 = max(0, min(width - 1, x1))
+            x2 = max(0, min(width - 1, x2))
+            y1 = max(0, min(height - 1, y1))
+            y2 = max(0, min(height - 1, y2))
+
+            if yolo_id == 0:
+                role = roles.get(obj_id, "normal")
+                if role == "follower":
+                    color = COLOR_CYCLIST_FOLLOWER
+                elif role == "leader":
+                    color = COLOR_CYCLIST_LEADER
+                else:
+                    color = COLOR_CYCLIST_NORMAL
+                label = f"{role}:{obj_id}"
+            elif yolo_id == 1:
+                color = COLOR_BICYCLE
+                rider_id = bike_to_cyclist.get(obj_id)
+                label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
+            else:
+                continue
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            if draw_labels:
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        if draw_pair_overlay and active_pairs:
+            x0, y0 = 12, 28
+            for i, (fid, lid) in enumerate(sorted(active_pairs.items())):
+                txt = f"Follower {fid} -> Leader {lid}"
+                cv2.putText(
+                    frame,
+                    txt,
+                    (x0, y0 + 18 * i),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        return frame
+
+    def annotate_following_segment_from_source(
+        self,
+        *,
+        input_video_path: str,
+        output_video_path: str,
+        df: pl.DataFrame,
+        cyclist_map: pl.DataFrame,
+        episodes: pl.DataFrame,
+        involved_cyclist_ids: set[int],
+        source_segment_start_seconds: float,
+        csv_start_frame: int,
+        csv_end_frame: int,
+        csv_fps: float,
+        frame_count_base: int = 1,
+        draw_all_bicyclists: bool = True,
+        draw_pair_overlay: bool = True,
+        draw_labels: bool = True,
+    ) -> None:
+        """Render an annotated clip using CSV frame-count as frame ordinal.
+
+        Important alignment rule:
+          CSV frame-count is treated as the ordinal decoded frame number inside
+          the mapped segment. For example, with one-based CSVs, frame-count 1 is
+          the first decoded frame of the mapped segment.
+
+        The function seeks once to the mapped segment start time, skips decoded
+        frames sequentially until ``csv_start_frame``, then reads exactly one
+        decoded video frame for each CSV frame. This avoids drift caused by
+        rounded or nominal FPS values such as 30 versus 30000/1001.
+        """
+        out_dir = os.path.dirname(output_video_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+
+        csv_start_frame = int(csv_start_frame)
+        csv_end_frame = int(csv_end_frame)
+        frame_count_base = int(frame_count_base)
+        if csv_end_frame < csv_start_frame:
+            raise ValueError(f"Invalid CSV frame range: {csv_start_frame}..{csv_end_frame}")
+
+        frame_to_rows, roles_for_frame, bike_to_cyclist = self._prepare_annotation_data(
+            df=df,
+            cyclist_map=cyclist_map,
+            episodes=episodes,
+            involved_cyclist_ids=involved_cyclist_ids,
+            draw_all_bicyclists=draw_all_bicyclists,
+        )
+
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {input_video_path}")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        opencv_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+
+        if width <= 0 or height <= 0:
+            cap.release()
+            raise RuntimeError(f"Invalid video dimensions for: {input_video_path} (w={width}, h={height})")
+
+        writer_fps = 0.0
+        try:
+            writer_fps = float(Analysis.get_video_fps(input_video_path))
+        except Exception:
+            writer_fps = 0.0
+        if writer_fps <= 0:
+            writer_fps = opencv_fps if opencv_fps > 0 else float(csv_fps or 0.0)
+        if writer_fps <= 0:
+            writer_fps = 30.0
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore
+        out = cv2.VideoWriter(output_video_path, fourcc, float(writer_fps), (width, height))
+        if not out.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open VideoWriter: {output_video_path}")
+
+        # Seek once to the mapped segment start. After that, do not convert every
+        # CSV frame through FPS. Frame-count is an ordinal frame number, so
+        # sequential reads are the least drift-prone alignment method.
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(source_segment_start_seconds) * 1000.0))
+
+        frames_to_skip = max(0, int(csv_start_frame) - int(frame_count_base))
+        skipped = 0
+
+        try:
+            while skipped < frames_to_skip:
+                ok, _ = cap.read()
+                if not ok:
+                    logger.warning(
+                        f"Could not skip to csv_frame={csv_start_frame}. "
+                        f"Stopped after skipping {skipped}/{frames_to_skip} decoded frames."
+                    )
+                    break
+                skipped += 1
+
+            for csv_frame in range(csv_start_frame, csv_end_frame + 1):
+                ok, frame = cap.read()
+                if not ok:
+                    logger.warning(
+                        f"Could not read source frame for csv_frame={csv_frame}. "
+                        f"Wrote frames through csv_frame={csv_frame - 1}."
+                    )
+                    break
+
+                frame = self._draw_annotation_frame(
+                    frame=frame,
+                    csv_frame=csv_frame,
+                    frame_to_rows=frame_to_rows,
+                    roles_for_frame=roles_for_frame,
+                    bike_to_cyclist=bike_to_cyclist,
+                    draw_pair_overlay=draw_pair_overlay,
+                    draw_labels=draw_labels,
+                )
+                out.write(frame)
+        finally:
+            cap.release()
+            out.release()
 
     def annotate_following_segment(
         self,
@@ -864,9 +1272,21 @@ if __name__ == "__main__":
             video_city, video_state, video_country = place
             logger.info(f"{file_str}: found values {video_city}, {video_state}, {video_country}.")
 
-            cyclist_map = cf.identify_bicyclists(df, min_shared_frames=30, score_thresh=0.0)
-            states = cf.build_cyclist_states(df, cyclist_map, prefer_vehicle_center=True)
             fps_csv = float(fps)  # from filename suffix
+            # Require a continuous person-bicycle association of about 2.0 seconds.
+            # This avoids short accidental overlaps being treated as cyclists.
+            min_continuous_shared_frames = max(1, int(math.ceil(2.0 * fps_csv)))
+            shared_run_gap_allow = max(0, int(math.ceil(0.1 * fps_csv)))
+            cyclist_map = cf.identify_bicyclists(
+                df,
+                min_shared_frames=30,
+                min_continuous_shared_frames=min_continuous_shared_frames,
+                shared_run_gap_allow=shared_run_gap_allow,
+                min_vehicle_width_ratio=0.50,
+                min_vehicle_width_ratio_frames=0.65,
+                score_thresh=0.0,
+            )
+            states = cf.build_cyclist_states(df, cyclist_map, prefer_vehicle_center=True)
             episodes = cf.detect_following_episodes(
                 states,
                 params=FollowingParams(
@@ -905,6 +1325,7 @@ if __name__ == "__main__":
                 should_annotate = should_annotate and (episodes.height > 0)
 
             if should_annotate:
+                local_video_path: Optional[str] = None
                 try:
                     involved_cyclists: set[int] = set()
                     if "follower_id" in episodes.columns:
@@ -945,12 +1366,20 @@ if __name__ == "__main__":
                     if fps_value <= 0:
                         fps_value = 25.0
 
-                    min_frame = int(df.select(pl.min("frame-count")).item()) if df.height > 0 else 0
-                    max_frame = int(df.select(pl.max("frame-count")).item()) if df.height > 0 else 0
-                    # IMPORTANT: frame-count is absolute within the segment; min_frame can be >0 simply
-                    # because early frames had no detections. Clip timing must be based on the actual
-                    # frame indices, not (max-min+1) starting at t=0.
-                    end_seconds = float(start_seconds) + (float(max_frame + 1) / float(fps_value)) if fps_value > 0 else float(start_seconds)  # noqa: E501
+                    min_frame = int(df.select(pl.min("frame-count")).item()) if df.height > 0 else 1
+                    max_frame = int(df.select(pl.max("frame-count")).item()) if df.height > 0 else 1
+                    frame_count_base = Analysis.infer_frame_count_base(df)
+                    # CSV frame-count is usually one-based in these YOLO outputs:
+                    # CSV frame 1 corresponds to the first video frame of the mapped segment.
+                    # Therefore frame N starts at (N - frame_count_base) / fps, not N / fps.
+                    end_seconds = Analysis.csv_frame_end_seconds(
+                        float(start_seconds), int(max_frame), float(fps_value), int(frame_count_base)
+                    ) if fps_value > 0 else float(start_seconds)
+                    logger.debug(
+                        f"{file_str}: frame-count base={frame_count_base}, "
+                        f"csv frames=[{min_frame}, {max_frame}], "
+                        f"segment seconds=[{start_seconds:.3f}, {end_seconds:.3f}]"
+                    )
 
                     # Decide which window(s) to annotate
                     os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
@@ -996,12 +1425,22 @@ if __name__ == "__main__":
 
                     jobs: list[dict] = []
 
-                    def _add_job(*, clip_start_s: float, clip_end_s: float, frame_offset: int,
+                    def _add_job(*, clip_start_frame: int, clip_end_frame: int,
                                  clip_name: str, annotated_name: str, annotated_dir: Optional[str] = None) -> None:
+                        clip_start_frame = int(clip_start_frame)
+                        clip_end_frame = int(clip_end_frame)
+                        clip_start_s = Analysis.csv_frame_start_seconds(
+                            float(start_seconds), clip_start_frame, float(fps_value), int(frame_count_base)
+                        )
+                        clip_end_s = Analysis.csv_frame_end_seconds(
+                            float(start_seconds), clip_end_frame, float(fps_value), int(frame_count_base)
+                        )
                         jobs.append({
                             'clip_start_s': float(clip_start_s),
                             'clip_end_s': float(clip_end_s),
-                            'frame_offset': int(frame_offset),
+                            'clip_start_frame': int(clip_start_frame),
+                            'clip_end_frame': int(clip_end_frame),
+                            'frame_offset': int(clip_start_frame),
                             'clip_name': str(clip_name),
                             'annotated_name': str(annotated_name),
                             'annotated_dir': str(annotated_dir) if annotated_dir is not None else str(ANNOTATED_VIDEOS_DIR),  # noqa: E501
@@ -1089,17 +1528,18 @@ if __name__ == "__main__":
                             if crop_end_frame <= crop_start_frame:
                                 crop_end_frame = min(max_frame, crop_start_frame + max(1, int(math.ceil(fps_value))))
 
-                            clip_start_s = float(start_seconds) + float(crop_start_frame) / float(fps_value)
-
-                            # +1 frame so we include crop_end_frame
-                            clip_end_s = float(start_seconds) + float(crop_end_frame + 1) / float(fps_value)
+                            clip_start_s = Analysis.csv_frame_start_seconds(
+                                float(start_seconds), int(crop_start_frame), float(fps_value), int(frame_count_base)
+                            )
+                            clip_end_s = Analysis.csv_frame_end_seconds(
+                                float(start_seconds), int(crop_end_frame), float(fps_value), int(frame_count_base)
+                            )
 
                             clip_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_crop.mp4"
                             annotated_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_following_crop_annotated.mp4"
                             _add_job(
-                                clip_start_s=clip_start_s,
-                                clip_end_s=clip_end_s,
-                                frame_offset=crop_start_frame,
+                                clip_start_frame=crop_start_frame,
+                                clip_end_frame=crop_end_frame,
                                 clip_name=clip_name,
                                 annotated_name=annotated_name,
                                 annotated_dir=annotated_dir_for_pair,
@@ -1112,18 +1552,16 @@ if __name__ == "__main__":
 
                         if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING:
                             _add_job(
-                                clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),  # noqa: E501
-                                clip_end_s=float(end_seconds),
-                                frame_offset=int(min_frame),
+                                clip_start_frame=int(min_frame),
+                                clip_end_frame=int(max_frame),
                                 clip_name=full_clip_name,
                                 annotated_name=full_annotated_name,
                             )
                     else:
                         # Default behavior: annotate the full CSV segment.
                         _add_job(
-                            clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),  # noqa: E501
-                            clip_end_s=float(end_seconds),
-                            frame_offset=int(min_frame),
+                            clip_start_frame=int(min_frame),
+                            clip_end_frame=int(max_frame),
                             clip_name=full_clip_name,
                             annotated_name=full_annotated_name,
                         )
@@ -1138,27 +1576,45 @@ if __name__ == "__main__":
                             os.makedirs(out_dir, exist_ok=True)
                             annotated_path = os.path.join(out_dir, job['annotated_name'])
 
-                            analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
-                            analysis.annotate_following_segment(
-                                input_video_path=clip_path,
+                            # Keep a plain trimmed source clip only when explicitly requested. Annotation itself
+                            # is rendered directly from the source video using CSV frame-count as an ordinal frame
+                            # number. This avoids one-frame offsets and drift from nominal FPS values such as 30
+                            # versus 30000/1001.
+                            if KEEP_TRIMMED_CLIP:
+                                analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
+
+                            analysis.annotate_following_segment_from_source(
+                                input_video_path=local_video_path,
                                 output_video_path=annotated_path,
                                 df=df,
                                 cyclist_map=cyclist_map,
                                 episodes=episodes,
                                 involved_cyclist_ids=involved_cyclists,
-                                frame_offset=int(job['frame_offset']),
-                                fps_override=fps_value,
+                                source_segment_start_seconds=float(start_seconds),
+                                csv_start_frame=int(job['clip_start_frame']),
+                                csv_end_frame=int(job['clip_end_frame']),
+                                csv_fps=float(fps_value),
+                                frame_count_base=int(frame_count_base),
                                 draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
                                 draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
                                 draw_labels=True,
                             )
                             logger.info(f"{file_str}: annotated video written to {annotated_path}")
 
-                            if not KEEP_TRIMMED_CLIP:
-                                try:
-                                    os.remove(clip_path)
-                                except Exception:
-                                    pass
-
                 except Exception as e:
                     logger.error(f"{file_str}: download/annotate failed: {e}")
+                finally:
+                    if bool(DELETE_DOWNLOADED_VIDEO_ON_COMPLETE) and local_video_path:
+                        try:
+                            downloaded_root = os.path.abspath(DOWNLOADED_VIDEOS_DIR)
+                            candidate = os.path.abspath(local_video_path)
+                            # Guard against accidentally deleting anything outside the download cache.
+                            if os.path.isfile(candidate) and os.path.commonpath([downloaded_root, candidate]) == downloaded_root:
+                                os.remove(candidate)
+                                logger.info(f"{file_str}: deleted downloaded source video {candidate}")
+                            elif os.path.exists(candidate):
+                                logger.warning(
+                                    f"{file_str}: not deleting downloaded source video outside download directory: {candidate}"
+                                )
+                        except Exception as cleanup_error:
+                            logger.warning(f"{file_str}: could not delete downloaded source video {local_video_path}: {cleanup_error}")

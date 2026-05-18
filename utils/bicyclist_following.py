@@ -79,6 +79,10 @@ class CyclistFollowing:
         df: pl.DataFrame,
         *,
         min_shared_frames: int = 4,
+        min_continuous_shared_frames: int = 60,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
         score_thresh: float = 0.0,
         person_class: int = PERSON_CLASS,
         bicycle_class: int = BICYCLE_CLASS,
@@ -86,7 +90,8 @@ class CyclistFollowing:
     ) -> pl.DataFrame:
         """
         Returns mapping table:
-          person_id (cyclist_id), bicycle_id, score, shared_frames
+          person_id (cyclist_id), bicycle_id, score, shared_frames, longest_shared_run,
+          vehicle_width_ratio, vehicle_width_ratio_pass_ratio
         """
         df = self._dedup_per_frame(df)
 
@@ -104,6 +109,10 @@ class CyclistFollowing:
                 df,
                 pid,
                 min_shared_frames=min_shared_frames,
+                min_continuous_shared_frames=min_continuous_shared_frames,
+                shared_run_gap_allow=shared_run_gap_allow,
+                min_vehicle_width_ratio=min_vehicle_width_ratio,
+                min_vehicle_width_ratio_frames=min_vehicle_width_ratio_frames,
                 person_class=person_class,
                 bicycle_class=bicycle_class,
             )
@@ -120,6 +129,9 @@ class CyclistFollowing:
                         "bicycle_id": int(res["vehicle_id"]),
                         "score": float(res["score"]),
                         "shared_frames": int(res.get("shared_frames", 0)),
+                        "longest_shared_run": int(res.get("longest_shared_run", 0)),
+                        "vehicle_width_ratio": float(res.get("vehicle_width_ratio", 0.0)),
+                        "vehicle_width_ratio_pass_ratio": float(res.get("vehicle_width_ratio_pass_ratio", 0.0)),
                     }
                 )
 
@@ -130,6 +142,9 @@ class CyclistFollowing:
                     "bicycle_id": pl.Series([], dtype=pl.Int64),
                     "score": pl.Series([], dtype=pl.Float64),
                     "shared_frames": pl.Series([], dtype=pl.Int64),
+                    "longest_shared_run": pl.Series([], dtype=pl.Int64),
+                    "vehicle_width_ratio": pl.Series([], dtype=pl.Float64),
+                    "vehicle_width_ratio_pass_ratio": pl.Series([], dtype=pl.Float64),
                 }
             )
 
@@ -139,7 +154,7 @@ class CyclistFollowing:
         # Keeping a 1-to-1 mapping reduces duplicate cyclists and downstream false following pairs.
         if enforce_unique_bicycle and out.height > 0:
             out = (
-                out.sort(["bicycle_id", "shared_frames", "score"], descending=[False, True, True])
+                out.sort(["bicycle_id", "longest_shared_run", "shared_frames", "vehicle_width_ratio_pass_ratio", "score"], descending=[False, True, True, True, True])
                    .unique(subset=["bicycle_id"], keep="first")
             )
 

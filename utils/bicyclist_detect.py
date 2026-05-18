@@ -30,12 +30,47 @@ class Algorithm():
         )
 
     @staticmethod
+    def _longest_frame_run(frames, *, gap_allow: int = 2) -> int:
+        """Return the longest near-continuous run of frame numbers.
+
+        gap_allow is the number of missing frames allowed inside one run.
+        For example, gap_allow=2 means frames 10 and 13 are still considered
+        part of the same run, because only 11 and 12 are missing.
+        """
+        try:
+            values = sorted({int(f) for f in frames})
+        except Exception:
+            return 0
+
+        if not values:
+            return 0
+
+        max_run = 1
+        cur_run = 1
+        max_gap = max(int(gap_allow), 0) + 1
+        prev = values[0]
+
+        for frame in values[1:]:
+            if int(frame) - int(prev) <= max_gap:
+                cur_run += 1
+            else:
+                max_run = max(max_run, cur_run)
+                cur_run = 1
+            prev = frame
+
+        return max(max_run, cur_run)
+
+    @staticmethod
     def classify_rider_type(
         df: pl.DataFrame,
         person_id,
         *,
         avg_height: Optional[float] = None,  # accepted for compatibility; not used for normalized scaling
         min_shared_frames: int = 4,
+        min_continuous_shared_frames: int = 60,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
         dist_rel_thresh: float = 0.8,
         prox_req: float = 0.7,
         alpha_x: float = 1.0,
@@ -65,6 +100,8 @@ class Algorithm():
           - vehicle_id
           - score
           - shared_frames
+          - longest_shared_run
+          - vehicle_width_ratio, vehicle_width_ratio_pass_ratio
           - prox_ratio, coloc_ratio, sim_ratio
         """
         if avg_height is not None:
@@ -72,12 +109,12 @@ class Algorithm():
                 if float(avg_height) <= 0.0:
                     return {
                         "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                        "score": 0.0, "shared_frames": 0
+                        "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
                     }
             except Exception:
                 return {
                     "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                    "score": 0.0, "shared_frames": 0
+                    "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
                 }
 
         df = Algorithm._dedup_per_frame(df)
@@ -89,14 +126,14 @@ class Algorithm():
         if p.height == 0:
             return {
                 "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                "score": 0.0, "shared_frames": 0
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
             }
 
         p_frames = p.get_column("frame-count").to_numpy()
         if p_frames.size < min_shared_frames:
             return {
                 "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                "score": 0.0, "shared_frames": 0
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
             }
 
         first_frame = int(p_frames.min())
@@ -112,7 +149,7 @@ class Algorithm():
         if vehicles.height == 0:
             return {
                 "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                "score": 0.0, "shared_frames": 0
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
             }
 
         vehicle_ids = vehicles.select("unique-id").unique().to_series().to_list()
@@ -145,6 +182,13 @@ class Algorithm():
             if shared < min_shared_frames:
                 continue
 
+            longest_shared_run = Algorithm._longest_frame_run(
+                j.get_column("frame-count").to_list(),
+                gap_allow=shared_run_gap_allow,
+            )
+            if role == "rider" and longest_shared_run < int(min_continuous_shared_frames):
+                continue
+
             p_xy = j.select(["x-center", "y-center"]).to_numpy()
             v_xy = j.select(["x-center_v", "y-center_v"]).to_numpy()
 
@@ -152,6 +196,18 @@ class Algorithm():
             p_h = j.get_column("height").to_numpy()
             v_w = j.get_column("width_v").to_numpy()
             v_h = j.get_column("height_v").to_numpy()
+
+            if role == "rider":
+                vehicle_width_ratio_arr = v_w / np.maximum(p_w, eps)
+                vehicle_width_ratio = float(np.median(vehicle_width_ratio_arr))
+                vehicle_width_ratio_pass_ratio = float(
+                    (vehicle_width_ratio_arr >= float(min_vehicle_width_ratio)).mean()
+                )
+                if vehicle_width_ratio_pass_ratio < float(min_vehicle_width_ratio_frames):
+                    continue
+            else:
+                vehicle_width_ratio = 0.0
+                vehicle_width_ratio_pass_ratio = 0.0
 
             dist = np.linalg.norm(p_xy - v_xy, axis=1)
             if role == "rider":
@@ -221,6 +277,9 @@ class Algorithm():
                 "vehicle_id": vid,
                 "score": float(score),
                 "shared_frames": int(shared),
+                "longest_shared_run": int(longest_shared_run),
+                "vehicle_width_ratio": float(vehicle_width_ratio),
+                "vehicle_width_ratio_pass_ratio": float(vehicle_width_ratio_pass_ratio),
                 "prox_ratio": prox_ratio,
                 "coloc_ratio": coloc_ratio,
                 "sim_ratio": float(sim_ratio),
@@ -232,7 +291,7 @@ class Algorithm():
         if best is None:
             return {
                 "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
-                "score": 0.0, "shared_frames": 0
+                "score": 0.0, "shared_frames": 0, "longest_shared_run": 0
             }
 
         return best
@@ -244,6 +303,10 @@ class Algorithm():
         *,
         avg_height: Optional[float] = None,
         min_shared_frames: int = 4,
+        min_continuous_shared_frames: int = 60,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
         dist_rel_thresh: float = 0.8,
         prox_req: float = 0.7,
         alpha_x: float = 1.0,
@@ -274,6 +337,10 @@ class Algorithm():
             person_id,
             avg_height=avg_height,
             min_shared_frames=min_shared_frames,
+            min_continuous_shared_frames=min_continuous_shared_frames,
+            shared_run_gap_allow=shared_run_gap_allow,
+            min_vehicle_width_ratio=min_vehicle_width_ratio,
+            min_vehicle_width_ratio_frames=min_vehicle_width_ratio_frames,
             dist_rel_thresh=dist_rel_thresh,
             prox_req=prox_req,
             alpha_x=alpha_x,
