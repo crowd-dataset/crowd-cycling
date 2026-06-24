@@ -43,6 +43,11 @@ from utils.analytics.geo import Geo  # noqa: E402
 from utils.analytics.io import IO  # noqa: E402
 from utils.bicyclist_detect import Algorithm  # noqa: E402
 from utils.bicyclist_following import CyclistFollowing, FollowingParams  # noqa: E402
+
+try:  # noqa: E402
+    from utils.bicyclist_following import TRAFFIC_CONTROL_PROXY_CLASS_IDS  # noqa: E402
+except ImportError:  # compatibility fallback for older cyclist_following.py
+    TRAFFIC_CONTROL_PROXY_CLASS_IDS = [9, 11]
 from utils.core.tools import Tools  # noqa: E402
 
 Analysis = analysis_module.Analysis
@@ -93,6 +98,15 @@ MIN_BICYCLE_WIDTH_RATIO_FRAMES = 0.65
 # Optional: pause after each saved sample.
 PAUSE_AFTER_EACH_SAMPLE = False
 
+# Regression guard for reviewer-confirmed true positives.
+# Format: <csv_filename_without_.csv>_f<follower_id>_l<leader_id>
+# Optional sampler prefixes such as sample_0011_ are also accepted.
+# The sampler checks these cases first; random sampling starts only if every
+# required true-positive pair still survives the updated detector and filters.
+TRUE_POSITIVE_REGRESSION_CASES = [
+    "32LIoZpuvqA_0_30_f5740_l5658",
+]
+
 MISC_FILES = {"DS_Store"}
 
 
@@ -132,6 +146,82 @@ def _cfg_float(key: str, default: float) -> float:
         return float(common.get_configs(key))
     except Exception:
         return default
+
+
+def _cfg_int(key: str, default: int) -> int:
+    try:
+        return int(common.get_configs(key))
+    except Exception:
+        return default
+
+
+def _cfg_int_list(key: str, default: list[int]) -> list[int]:
+    """Best-effort config lookup for a list of integer class ids.
+
+    Accepts real lists/tuples/sets and simple strings such as:
+      "9,11", "[9, 11]", or "9".
+    """
+    try:
+        value = common.get_configs(key)
+    except Exception:
+        return list(default)
+
+    if value is None:
+        return list(default)
+
+    items = []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return list(default)
+        text = text.strip("[](){}")
+        items = [part.strip().strip("'\"") for part in text.split(",")]
+    else:
+        items = [value]
+
+    out: list[int] = []
+    for item in items:
+        if item is None or str(item).strip() == "":
+            continue
+        try:
+            out.append(int(item))
+        except Exception:
+            continue
+
+    return out if out else list(default)
+
+
+def _cfg_str_list(key: str, default: list[str]) -> list[str]:
+    """Best-effort config lookup for a list of strings.
+
+    Accepts real lists/tuples/sets and simple strings such as:
+      "a,b", "[a, b]", or one item per line.
+    """
+    try:
+        value = common.get_configs(key)
+    except Exception:
+        return list(default)
+
+    if value is None:
+        return list(default)
+
+    if isinstance(value, (list, tuple, set)):
+        out = [str(v).strip().strip("'\"") for v in value if str(v).strip()]
+        return out if out else list(default)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return list(default)
+        text = text.strip("[](){}")
+        normalised = text.replace("\n", ",").replace(";", ",")
+        out = [part.strip().strip("'\"") for part in normalised.split(",") if part.strip()]
+        return out if out else list(default)
+
+    text = str(value).strip()
+    return [text] if text else list(default)
 
 
 def _cfg_float_opt(key: str, default: Optional[float] = None) -> Optional[float]:
@@ -199,6 +289,14 @@ class SampleContext:
     episodes: pl.DataFrame
 
 
+@dataclass(frozen=True)
+class TruePositiveCase:
+    raw_name: str
+    filename_no_ext: str
+    follower_id: int
+    leader_id: int
+
+
 MANIFEST_FIELDS = [
     "sample_index",
     "source_csv",
@@ -206,6 +304,9 @@ MANIFEST_FIELDS = [
     "city",
     "state",
     "country",
+    "traffic_control_proxy",
+    "traffic_control_proxy_count",
+    "traffic_control_pair_min_distance",
     "follower_id",
     "leader_id",
     "episode_start_frame",
@@ -214,6 +315,19 @@ MANIFEST_FIELDS = [
     "crop_end_frame",
     "fps",
     "output_path",
+]
+
+
+TRUE_POSITIVE_REGRESSION_FIELDS = [
+    "case_name",
+    "source_csv",
+    "follower_id",
+    "leader_id",
+    "status",
+    "reason",
+    "detected_pairs",
+    "episode_start_frame",
+    "episode_end_frame",
 ]
 
 
@@ -251,6 +365,73 @@ class CyclistFollowingRandomSampler:
             _cfg_bool("ANNOTATE_ALL_BICYCLISTS", True)
             if DRAW_ALL_BICYCLISTS_FROM_CONFIG
             else False
+        )
+
+        # Keep the random sampler aligned with the main following pipeline:
+        # when enabled, only sample follower->leader episodes that occur near
+        # a traffic light or stop sign detection. The actual filtering method
+        # lives in utils.bicyclist_following.CyclistFollowing.
+        self.filter_following_by_traffic_proxy = _cfg_bool(
+            "FILTER_FOLLOWING_BY_TRAFFIC_CONTROL_PROXY",
+            True,
+        )
+        self.traffic_control_proxy_classes = _cfg_int_list(
+            "TRAFFIC_CONTROL_PROXY_CLASSES",
+            TRAFFIC_CONTROL_PROXY_CLASS_IDS,
+        )
+        self.traffic_control_proxy_frame_buffer_seconds = _cfg_float(
+            "TRAFFIC_CONTROL_PROXY_FRAME_BUFFER_SECONDS",
+            3.0,
+        )
+        self.traffic_control_proxy_min_detections = max(
+            1,
+            _cfg_int("TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS", 1),
+        )
+        self.traffic_control_proxy_min_confidence = _cfg_float_opt(
+            "TRAFFIC_CONTROL_PROXY_MIN_CONFIDENCE",
+            None,
+        )
+
+        # Reviewer-aligned crossing-event proxy settings. These make the sampler
+        # stricter than generic cyclist platooning: the traffic-control object
+        # must be close in time and, when coordinates are available, spatially
+        # close to the sampled pair. Time-headway gates remove cases where the
+        # follower crosses much later than the leader.
+        self.crossing_event_proxy_frame_buffer_seconds = _cfg_float(
+            "CROSSING_EVENT_PROXY_FRAME_BUFFER_SECONDS",
+            0.75,
+        )
+        self.crossing_event_proxy_max_pair_distance = _cfg_float_opt(
+            "CROSSING_EVENT_PROXY_MAX_PAIR_DISTANCE",
+            0.35,
+        )
+        self.crossing_event_proxy_same_frame_tolerance_seconds = _cfg_float(
+            "CROSSING_EVENT_PROXY_SAME_FRAME_TOLERANCE_SECONDS",
+            0.50,
+        )
+        self.max_mean_time_headway_seconds = _cfg_float_opt(
+            "MAX_MEAN_TIME_HEADWAY_SECONDS",
+            3.0,
+        )
+        self.max_p90_time_headway_seconds = _cfg_float_opt(
+            "MAX_P90_TIME_HEADWAY_SECONDS",
+            5.0,
+        )
+
+        # Reviewer-confirmed positives are used as a regression test before new
+        # random samples are generated. This prevents stricter filters from
+        # accidentally removing the small set of known valid crossing-following
+        # examples.
+        self.true_positive_regression_cases = self.parse_true_positive_cases(
+            _cfg_str_list("TRUE_POSITIVE_REGRESSION_CASES", TRUE_POSITIVE_REGRESSION_CASES)
+        )
+        self.require_true_positive_regression_pass = _cfg_bool(
+            "REQUIRE_TRUE_POSITIVE_REGRESSION_PASS",
+            True,
+        )
+        self.skip_true_positive_cases_during_random_sampling = _cfg_bool(
+            "SKIP_TRUE_POSITIVE_CASES_DURING_RANDOM_SAMPLING",
+            True,
         )
 
         self.secret = SimpleNamespace(
@@ -374,12 +555,57 @@ class CyclistFollowingRandomSampler:
                 gap_allow=10,
                 min_co_visible_seconds=self.min_co_visible_seconds,
                 include_pairs_below_min_co_visible=self.annotate_below_min_coviz,
+                max_mean_time_headway_seconds=self.max_mean_time_headway_seconds,
+                max_p90_time_headway_seconds=self.max_p90_time_headway_seconds,
             ),
             fps=fps_from_name,
         )
 
         if episodes.height == 0:
             return None
+
+        if bool(self.filter_following_by_traffic_proxy):
+            filter_method = getattr(
+                self.cf,
+                "filter_following_episodes_by_traffic_control_proxy",
+                None,
+            )
+            if filter_method is None:
+                raise RuntimeError(
+                    "FILTER_FOLLOWING_BY_TRAFFIC_CONTROL_PROXY is enabled, but "
+                    "utils.bicyclist_following.CyclistFollowing does not have "
+                    "filter_following_episodes_by_traffic_control_proxy(). "
+                    "Please update utils/bicyclist_following.py first."
+                )
+
+            before_count = int(episodes.height)
+            episodes = filter_method(
+                episodes=episodes,
+                df=df,
+                fps=fps_from_name,
+                class_ids=self.traffic_control_proxy_classes,
+                frame_buffer_seconds=self.crossing_event_proxy_frame_buffer_seconds,
+                min_detections=self.traffic_control_proxy_min_detections,
+                min_confidence=self.traffic_control_proxy_min_confidence,
+                states=states,
+                max_pair_distance=self.crossing_event_proxy_max_pair_distance,
+                same_frame_tolerance_seconds=self.crossing_event_proxy_same_frame_tolerance_seconds,
+                max_mean_time_headway_seconds=self.max_mean_time_headway_seconds,
+                max_p90_time_headway_seconds=self.max_p90_time_headway_seconds,
+            )
+
+            if episodes.height == 0:
+                return None
+
+            logger.info(
+                f"{file_str}: kept {episodes.height}/{before_count} following episodes "
+                f"with traffic-control proxy classes={self.traffic_control_proxy_classes}, "
+                f"buffer={self.crossing_event_proxy_frame_buffer_seconds}s, "
+                f"max_pair_distance={self.crossing_event_proxy_max_pair_distance}, "
+                f"max_mean_thw={self.max_mean_time_headway_seconds}s, "
+                f"max_p90_thw={self.max_p90_time_headway_seconds}s, "
+                f"min_detections={self.traffic_control_proxy_min_detections}."
+            )
 
         city, state, country = place
         return SampleContext(
@@ -397,6 +623,263 @@ class CyclistFollowingRandomSampler:
             states=states,
             episodes=episodes,
         )
+
+    @staticmethod
+    def parse_true_positive_case(raw_name: str) -> Optional[TruePositiveCase]:
+        """Parse a reviewer-confirmed true-positive case name.
+
+        Accepted examples:
+          32LIoZpuvqA_0_30_f5740_l5658
+          sample_0011_32LIoZpuvqA_0_30_f5740_l5658
+        """
+        text = str(raw_name).strip()
+        if not text:
+            return None
+
+        parts = text.split("_")
+        if len(parts) >= 3 and parts[0] == "sample" and parts[1].isdigit():
+            text = "_".join(parts[2:])
+
+        try:
+            filename_part, leader_part = text.rsplit("_l", 1)
+            filename_no_ext, follower_part = filename_part.rsplit("_f", 1)
+            follower_id = int(follower_part)
+            leader_id = int(leader_part)
+        except Exception:
+            logger.warning(
+                f"Could not parse TRUE_POSITIVE_REGRESSION_CASES entry: {raw_name}. "
+                "Expected <csv_filename_without_.csv>_f<follower_id>_l<leader_id>."
+            )
+            return None
+
+        if not filename_no_ext:
+            logger.warning(f"Empty CSV stem in true-positive case: {raw_name}.")
+            return None
+
+        return TruePositiveCase(
+            raw_name=str(raw_name),
+            filename_no_ext=str(filename_no_ext),
+            follower_id=int(follower_id),
+            leader_id=int(leader_id),
+        )
+
+    @classmethod
+    def parse_true_positive_cases(cls, raw_cases: list[str]) -> list[TruePositiveCase]:
+        cases: list[TruePositiveCase] = []
+        seen: set[tuple[str, int, int]] = set()
+
+        for raw in raw_cases:
+            case = cls.parse_true_positive_case(raw)
+            if case is None:
+                continue
+            key = (case.filename_no_ext, case.follower_id, case.leader_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            cases.append(case)
+
+        return cases
+
+    @staticmethod
+    def _csv_job_index(csv_jobs: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
+        """Map CSV stem to job, using the cleaned filename convention."""
+        out: dict[str, tuple[str, str]] = {}
+        tools = Tools()
+
+        for folder_path, file_name in csv_jobs:
+            try:
+                clean_name = tools.clean_csv_filename(file_name)
+                stem = os.path.splitext(clean_name)[0]
+            except Exception:
+                stem = os.path.splitext(str(file_name))[0]
+            out.setdefault(stem, (folder_path, file_name))
+
+        return out
+
+    @staticmethod
+    def _episode_pair_exists(episodes: pl.DataFrame, follower_id: int, leader_id: int) -> bool:
+        try:
+            return (
+                episodes
+                .filter(
+                    (pl.col("follower_id").cast(pl.Int64, strict=False) == int(follower_id))
+                    & (pl.col("leader_id").cast(pl.Int64, strict=False) == int(leader_id))
+                )
+                .height
+                > 0
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pair_episode_frame_range(episodes: pl.DataFrame, follower_id: int, leader_id: int) -> tuple[str, str]:
+        try:
+            pair_eps = episodes.filter(
+                (pl.col("follower_id").cast(pl.Int64, strict=False) == int(follower_id))
+                & (pl.col("leader_id").cast(pl.Int64, strict=False) == int(leader_id))
+            )
+            if pair_eps.height == 0:
+                return "", ""
+            return (
+                str(int(pair_eps.select(pl.min("start_frame")).item())),
+                str(int(pair_eps.select(pl.max("end_frame")).item())),
+            )
+        except Exception:
+            return "", ""
+
+    @staticmethod
+    def _detected_pair_summary(episodes: pl.DataFrame, limit: int = 20) -> str:
+        try:
+            if episodes is None or episodes.height == 0:
+                return ""
+            unique_pairs = episodes.select(["follower_id", "leader_id"]).unique()
+            pairs = unique_pairs.sort(["follower_id", "leader_id"]).head(limit).iter_rows()
+            out = [f"f{int(fid)}->l{int(lid)}" for fid, lid in pairs]
+            if unique_pairs.height > limit:
+                out.append("...")
+            return "; ".join(out)
+        except Exception:
+            return ""
+
+    def _known_true_positive_pair_keys(self) -> set[tuple[str, int, int]]:
+        return {
+            (case.filename_no_ext, int(case.follower_id), int(case.leader_id))
+            for case in self.true_positive_regression_cases
+        }
+
+    def validate_true_positive_regression_cases(
+        self,
+        *,
+        csv_jobs: list[tuple[str, str]],
+        df_mapping: pl.DataFrame,
+        id_to_place: dict[int, tuple[str, str, str]],
+    ) -> bool:
+        """Run known true positives through the full updated detector first.
+
+        If a reviewer-confirmed positive is no longer detected, random sampling
+        is stopped by default so thresholds can be optimised before collecting
+        more candidate clips.
+        """
+        cases = list(self.true_positive_regression_cases)
+        if not cases:
+            return True
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        report_path = os.path.join(self.output_dir, "true_positive_regression_report.csv")
+        job_index = self._csv_job_index(csv_jobs)
+        rows: list[dict[str, object]] = []
+        all_passed = True
+
+        print(f"Checking {len(cases)} reviewer-confirmed true-positive case(s) before random sampling...")
+
+        for case in cases:
+            job = job_index.get(case.filename_no_ext)
+            if job is None:
+                all_passed = False
+                reason = f"CSV not found in configured data folders: {case.filename_no_ext}.csv"
+                print(f"✗ {case.raw_name}: {reason}")
+                rows.append({
+                    "case_name": case.raw_name,
+                    "source_csv": f"{case.filename_no_ext}.csv",
+                    "follower_id": int(case.follower_id),
+                    "leader_id": int(case.leader_id),
+                    "status": "FAIL",
+                    "reason": reason,
+                    "detected_pairs": "",
+                    "episode_start_frame": "",
+                    "episode_end_frame": "",
+                })
+                continue
+
+            folder_path, file_name = job
+            try:
+                context = self.detect_cases_in_csv(
+                    folder_path=folder_path,
+                    file_name=file_name,
+                    df_mapping=df_mapping,
+                    id_to_place=id_to_place,
+                )
+            except Exception as exc:
+                context = None
+                all_passed = False
+                reason = f"Detector raised an error: {exc}"
+                print(f"✗ {case.raw_name}: {reason}")
+                rows.append({
+                    "case_name": case.raw_name,
+                    "source_csv": file_name,
+                    "follower_id": int(case.follower_id),
+                    "leader_id": int(case.leader_id),
+                    "status": "FAIL",
+                    "reason": reason,
+                    "detected_pairs": "",
+                    "episode_start_frame": "",
+                    "episode_end_frame": "",
+                })
+                continue
+
+            if context is None:
+                all_passed = False
+                reason = "CSV produced no following episodes after the updated filters"
+                print(f"✗ {case.raw_name}: {reason}")
+                rows.append({
+                    "case_name": case.raw_name,
+                    "source_csv": file_name,
+                    "follower_id": int(case.follower_id),
+                    "leader_id": int(case.leader_id),
+                    "status": "FAIL",
+                    "reason": reason,
+                    "detected_pairs": "",
+                    "episode_start_frame": "",
+                    "episode_end_frame": "",
+                })
+                continue
+
+            detected_pairs = self._detected_pair_summary(context.episodes)
+            if not self._episode_pair_exists(context.episodes, case.follower_id, case.leader_id):
+                all_passed = False
+                reason = "Expected follower->leader pair was not detected after the updated filters"
+                print(f"✗ {case.raw_name}: {reason}. Detected pairs: {detected_pairs or 'none'}")
+                rows.append({
+                    "case_name": case.raw_name,
+                    "source_csv": context.file_name,
+                    "follower_id": int(case.follower_id),
+                    "leader_id": int(case.leader_id),
+                    "status": "FAIL",
+                    "reason": reason,
+                    "detected_pairs": detected_pairs,
+                    "episode_start_frame": "",
+                    "episode_end_frame": "",
+                })
+                continue
+
+            start_frame, end_frame = self._pair_episode_frame_range(
+                context.episodes, case.follower_id, case.leader_id
+            )
+            print(
+                f"✓ {case.raw_name}: detected f{case.follower_id}->l{case.leader_id} "
+                f"in frames {start_frame}-{end_frame}"
+            )
+            rows.append({
+                "case_name": case.raw_name,
+                "source_csv": context.file_name,
+                "follower_id": int(case.follower_id),
+                "leader_id": int(case.leader_id),
+                "status": "PASS",
+                "reason": "Expected pair detected",
+                "detected_pairs": detected_pairs,
+                "episode_start_frame": start_frame,
+                "episode_end_frame": end_frame,
+            })
+
+        self.write_rows(report_path, TRUE_POSITIVE_REGRESSION_FIELDS, rows)
+        print(f"True-positive regression report: {report_path}")
+
+        if all_passed:
+            print("All true-positive regression checks passed. Starting random sampling.")
+        else:
+            print("At least one true-positive regression check failed.")
+
+        return bool(all_passed)
 
     @staticmethod
     def unique_pairs(episodes: pl.DataFrame, rng: random.Random) -> list[tuple[int, int]]:
@@ -662,6 +1145,49 @@ class CyclistFollowingRandomSampler:
         )
 
     @staticmethod
+    def traffic_proxy_count_for_episodes(episodes: pl.DataFrame) -> int:
+        """Return the total traffic-control proxy detections for sampled episodes."""
+        try:
+            if episodes is None or episodes.height == 0:
+                return 0
+            if "traffic_control_proxy_count" not in episodes.columns:
+                return 0
+            return int(
+                episodes
+                .select(pl.col("traffic_control_proxy_count").fill_null(0).sum())
+                .item()
+            )
+        except Exception:
+            return 0
+
+    @staticmethod
+    def traffic_proxy_min_distance_for_episodes(episodes: pl.DataFrame) -> Optional[float]:
+        """Return the nearest cyclist-pair to traffic-control proxy distance."""
+        try:
+            if episodes is None or episodes.height == 0:
+                return None
+            if "traffic_control_pair_min_distance" not in episodes.columns:
+                return None
+            value = (
+                episodes
+                .select(pl.col("traffic_control_pair_min_distance").drop_nulls().min())
+                .item()
+            )
+            return None if value is None else float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def write_rows(path: str, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
+        """Write a small CSV report, replacing any previous copy."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+    @staticmethod
     def write_manifest_row(manifest_path: str, row: dict) -> None:
         file_exists = os.path.exists(manifest_path)
         with open(manifest_path, "a", newline="", encoding="utf-8") as f:
@@ -744,6 +1270,9 @@ class CyclistFollowingRandomSampler:
                 "city": context.city,
                 "state": context.state,
                 "country": context.country,
+                "traffic_control_proxy": bool(self.traffic_proxy_count_for_episodes(pair_eps) > 0),
+                "traffic_control_proxy_count": int(self.traffic_proxy_count_for_episodes(pair_eps)),
+                "traffic_control_pair_min_distance": self.traffic_proxy_min_distance_for_episodes(pair_eps),
                 "follower_id": int(follower_id),
                 "leader_id": int(leader_id),
                 "episode_start_frame": int(episode_start),
@@ -776,12 +1305,25 @@ class CyclistFollowingRandomSampler:
                     continue
                 csv_jobs.append((folder_path, file_name))
 
+        regression_ok = self.validate_true_positive_regression_cases(
+            csv_jobs=csv_jobs,
+            df_mapping=df_mapping,
+            id_to_place=id_to_place,
+        )
+        if not regression_ok and bool(self.require_true_positive_regression_pass):
+            print(
+                "Stopped before random sampling because a reviewer-confirmed true positive "
+                "was not detected. Loosen or optimise the new filters, then rerun."
+            )
+            return
+
         rng.shuffle(csv_jobs)
 
         manifest_path = os.path.join(self.output_dir, "samples_manifest.csv")
         saved_count = 0
+        known_true_positive_pair_keys = self._known_true_positive_pair_keys()
 
-        print(f"Looking for {requested_cases} random cyclist following cases...")
+        print(f"Looking for {requested_cases} new random cyclist following cases...")
         print(f"Outputs will be written to: {self.output_dir}")
 
         for folder_path, file_name in csv_jobs:
@@ -817,6 +1359,17 @@ class CyclistFollowingRandomSampler:
                 for follower_id, leader_id in pairs:
                     if saved_count >= requested_cases:
                         break
+
+                    pair_key = (context.filename_no_ext, int(follower_id), int(leader_id))
+                    if (
+                        bool(self.skip_true_positive_cases_during_random_sampling)
+                        and pair_key in known_true_positive_pair_keys
+                    ):
+                        logger.info(
+                            f"{context.file_name}: skipping known true-positive regression pair "
+                            f"{follower_id}->{leader_id} during new random sampling."
+                        )
+                        continue
 
                     crop_info = self.crop_window_for_pair(
                         context=context,

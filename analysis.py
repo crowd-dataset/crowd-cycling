@@ -15,7 +15,13 @@ import polars as pl
 import cv2
 from types import SimpleNamespace                # lightweight config container
 from utils.bicyclist_detect import Algorithm
-from utils.bicyclist_following import CyclistFollowing, FollowingParams
+from utils.bicyclist_following import (
+    CyclistFollowing,
+    FollowingParams,
+    TRAFFIC_CONTROL_PROXY_CLASS_IDS,
+    YOLO_STOP_SIGN_CLASS,
+    YOLO_TRAFFIC_LIGHT_CLASS,
+)
 from utils.analytics.io import IO
 from utils.core.tools import Tools
 from utils.analytics.geo import Geo
@@ -88,6 +94,54 @@ def _cfg_float_opt(key: str, default: Optional[float] = None) -> Optional[float]
         return default
 
 
+def _cfg_int(key: str, default: int) -> int:
+    """Best-effort integer config lookup with a safe fallback."""
+    try:
+        v = common.get_configs(key)
+        if v is None:
+            return default
+        if isinstance(v, str) and v.strip() == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _cfg_int_list(key: str, default: list[int]) -> list[int]:
+    """Best-effort integer-list config lookup with a safe fallback.
+
+    Supports lists from JSON as well as strings such as "9,11" or "[9, 11]".
+    """
+    try:
+        v = common.get_configs(key)
+        if v is None:
+            return list(default)
+
+        raw_values = []
+        if isinstance(v, (list, tuple, set)):
+            raw_values = list(v)
+        elif isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return list(default)
+            if s.startswith("[") and s.endswith("]"):
+                s = s[1:-1]
+            raw_values = [part.strip() for part in s.split(",") if part.strip()]
+        else:
+            raw_values = [v]
+
+        out: list[int] = []
+        for item in raw_values:
+            try:
+                out.append(int(float(item)))
+            except Exception:
+                continue
+
+        return out if out else list(default)
+    except Exception:
+        return list(default)
+
+
 # When True: if cyclist-following episodes are detected in a CSV, the script will
 # download the corresponding source video and generate an annotated video showing
 # the involved cyclists (and their bicycles) across the entire CSV segment.
@@ -137,6 +191,69 @@ ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS: bool = _cfg_bool("ANNOTATE_BELOW_MIN_CO_V
 ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING: bool = _cfg_bool("ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING", False)
 
 
+# Crossing proxy controls (traffic light / stop sign)
+# COCO YOLO class ids: traffic light=9, stop sign=11. If your model uses different
+# ids, set TRAFFIC_CONTROL_PROXY_CLASSES in config accordingly.
+YOLO_TRAFFIC_LIGHT_CLASS = 9
+YOLO_STOP_SIGN_CLASS = 11
+FILTER_FOLLOWING_BY_TRAFFIC_CONTROL_PROXY: bool = _cfg_bool(
+    "FILTER_FOLLOWING_BY_TRAFFIC_CONTROL_PROXY",
+    True,
+)
+TRAFFIC_CONTROL_PROXY_CLASSES: list[int] = _cfg_int_list(
+    "TRAFFIC_CONTROL_PROXY_CLASSES",
+    TRAFFIC_CONTROL_PROXY_CLASS_IDS,
+)
+# Keep an episode if at least TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS traffic-control
+# detections occur between episode start/end, expanded by this many seconds.
+TRAFFIC_CONTROL_PROXY_FRAME_BUFFER_SECONDS: float = _cfg_float(
+    "TRAFFIC_CONTROL_PROXY_FRAME_BUFFER_SECONDS",
+    3.0,
+)
+# Stricter reviewer-aligned crossing event gates. These are used when filtering
+# following episodes before annotation. The old temporal proxy is kept for
+# backwards compatibility, while these defaults reject common false positives:
+# ordinary platooning, unrelated traffic lights/signs elsewhere in the frame,
+# and cases where the follower crosses too late after the leader.
+CROSSING_EVENT_PROXY_FRAME_BUFFER_SECONDS: float = _cfg_float(
+    "CROSSING_EVENT_PROXY_FRAME_BUFFER_SECONDS",
+    0.75,
+)
+CROSSING_EVENT_PROXY_MAX_PAIR_DISTANCE: Optional[float] = _cfg_float_opt(
+    "CROSSING_EVENT_PROXY_MAX_PAIR_DISTANCE",
+    0.35,
+)
+CROSSING_EVENT_PROXY_SAME_FRAME_TOLERANCE_SECONDS: float = _cfg_float(
+    "CROSSING_EVENT_PROXY_SAME_FRAME_TOLERANCE_SECONDS",
+    0.50,
+)
+MAX_MEAN_TIME_HEADWAY_SECONDS: Optional[float] = _cfg_float_opt(
+    "MAX_MEAN_TIME_HEADWAY_SECONDS",
+    3.0,
+)
+MAX_P90_TIME_HEADWAY_SECONDS: Optional[float] = _cfg_float_opt(
+    "MAX_P90_TIME_HEADWAY_SECONDS",
+    5.0,
+)
+TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS: int = max(
+    1,
+    _cfg_int("TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS", 1),
+)
+# Optional extra confidence threshold for traffic lights / stop signs. Leave empty
+# or missing to rely on the global CSV confidence filter.
+TRAFFIC_CONTROL_PROXY_MIN_CONFIDENCE: Optional[float] = _cfg_float_opt(
+    "TRAFFIC_CONTROL_PROXY_MIN_CONFIDENCE",
+    None,
+)
+# Draw traffic light / stop sign boxes in the annotated videos for manual checking.
+ANNOTATE_TRAFFIC_CONTROL_PROXY: bool = _cfg_bool("ANNOTATE_TRAFFIC_CONTROL_PROXY", True)
+
+TRAFFIC_CONTROL_PROXY_CLASS_LABELS: dict[int, str] = {
+    YOLO_TRAFFIC_LIGHT_CLASS: "traffic-light",
+    YOLO_STOP_SIGN_CLASS: "stop-sign",
+}
+
+
 # -----------------------------------------------------------------------------
 # ANNOTATION COLORS (BGR)
 # -----------------------------------------------------------------------------
@@ -148,6 +265,9 @@ COLOR_CYCLIST_FOLLOWING = (0, 255, 0)  # green
 COLOR_CYCLIST_LEADER = COLOR_CYCLIST_FOLLOWING  # alias for clarity
 COLOR_CYCLIST_NORMAL = (0, 215, 255)   # orange/yellow-ish (visible on most backgrounds)
 COLOR_BICYCLE = (255, 0, 0)            # blue
+COLOR_TRAFFIC_LIGHT = (0, 255, 255)    # yellow/cyan-ish in BGR
+COLOR_STOP_SIGN = (255, 255, 255)      # white
+COLOR_TRAFFIC_CONTROL_PROXY = (255, 255, 0)
 
 
 class Analysis():
@@ -590,12 +710,21 @@ class Analysis():
             return roles, active_pairs
 
         frame_to_rows: dict[int, list[dict]] = {}
-        if df.height > 0 and (cyclist_ids or bicycle_ids):
-            wanted = (
-                df.filter(
-                    ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
-                    ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+        traffic_proxy_class_ids = [int(x) for x in TRAFFIC_CONTROL_PROXY_CLASSES]
+        draw_traffic_proxy = bool(ANNOTATE_TRAFFIC_CONTROL_PROXY) and bool(traffic_proxy_class_ids)
+
+        if df.height > 0 and (cyclist_ids or bicycle_ids or draw_traffic_proxy):
+            object_filter = (
+                ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
+                ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+            )
+            if draw_traffic_proxy:
+                object_filter = object_filter | (
+                    pl.col("yolo-id").cast(pl.Int64, strict=False).is_in(traffic_proxy_class_ids)
                 )
+
+            wanted = (
+                df.filter(object_filter)
                 .select(["frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"])
             )
             for row in wanted.iter_rows(named=True):
@@ -658,6 +787,15 @@ class Analysis():
                 color = COLOR_BICYCLE
                 rider_id = bike_to_cyclist.get(obj_id)
                 label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
+            elif yolo_id in set(int(x) for x in TRAFFIC_CONTROL_PROXY_CLASSES):
+                if yolo_id == YOLO_TRAFFIC_LIGHT_CLASS:
+                    color = COLOR_TRAFFIC_LIGHT
+                elif yolo_id == YOLO_STOP_SIGN_CLASS:
+                    color = COLOR_STOP_SIGN
+                else:
+                    color = COLOR_TRAFFIC_CONTROL_PROXY
+                class_label = TRAFFIC_CONTROL_PROXY_CLASS_LABELS.get(yolo_id, f"traffic-control-{yolo_id}")
+                label = f"{class_label}:{obj_id}"
             else:
                 continue
 
@@ -931,12 +1069,21 @@ class Analysis():
         # we can accidentally pull a CAR row (yolo-id=2) that shares the same unique-id as a BICYCLE row (yolo-id=1),
         # and then it gets drawn with the wrong label. To avoid that, we filter by BOTH class and id.
         frame_to_rows: dict[int, list[dict]] = {}
-        if df.height > 0 and (cyclist_ids or bicycle_ids):
-            wanted = (
-                df.filter(
-                    ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
-                    ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+        traffic_proxy_class_ids = [int(x) for x in TRAFFIC_CONTROL_PROXY_CLASSES]
+        draw_traffic_proxy = bool(ANNOTATE_TRAFFIC_CONTROL_PROXY) and bool(traffic_proxy_class_ids)
+
+        if df.height > 0 and (cyclist_ids or bicycle_ids or draw_traffic_proxy):
+            object_filter = (
+                ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
+                ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+            )
+            if draw_traffic_proxy:
+                object_filter = object_filter | (
+                    pl.col("yolo-id").cast(pl.Int64, strict=False).is_in(traffic_proxy_class_ids)
                 )
+
+            wanted = (
+                df.filter(object_filter)
                 .select(["frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"])
             )
             for row in wanted.iter_rows(named=True):
@@ -1023,6 +1170,15 @@ class Analysis():
                         color = COLOR_BICYCLE
                         rider_id = bike_to_cyclist.get(obj_id)
                         label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
+                    elif yolo_id in set(int(x) for x in TRAFFIC_CONTROL_PROXY_CLASSES):
+                        if yolo_id == YOLO_TRAFFIC_LIGHT_CLASS:
+                            color = COLOR_TRAFFIC_LIGHT
+                        elif yolo_id == YOLO_STOP_SIGN_CLASS:
+                            color = COLOR_STOP_SIGN
+                        else:
+                            color = COLOR_TRAFFIC_CONTROL_PROXY
+                        class_label = TRAFFIC_CONTROL_PROXY_CLASS_LABELS.get(yolo_id, f"traffic-control-{yolo_id}")
+                        label = f"{class_label}:{obj_id}"
                     else:
                         # Skip all other object classes (e.g., cars/buses/trucks).
                         continue
@@ -1300,10 +1456,38 @@ if __name__ == "__main__":
                     gap_allow=10,
                     min_co_visible_seconds=MIN_CO_VISIBLE_SECONDS,
                     include_pairs_below_min_co_visible=ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS,
+                    max_mean_time_headway_seconds=MAX_MEAN_TIME_HEADWAY_SECONDS,
+                    max_p90_time_headway_seconds=MAX_P90_TIME_HEADWAY_SECONDS,
                 ),
                 fps=fps_csv,
             )
             logger.info(str(cyclist_map))
+
+            if bool(FILTER_FOLLOWING_BY_TRAFFIC_CONTROL_PROXY):
+                raw_episode_count = int(episodes.height)
+                episodes = cf.filter_following_episodes_by_traffic_control_proxy(
+                    episodes=episodes,
+                    df=df,
+                    fps=fps_csv,
+                    class_ids=TRAFFIC_CONTROL_PROXY_CLASSES,
+                    frame_buffer_seconds=CROSSING_EVENT_PROXY_FRAME_BUFFER_SECONDS,
+                    min_detections=TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS,
+                    min_confidence=TRAFFIC_CONTROL_PROXY_MIN_CONFIDENCE,
+                    states=states,
+                    max_pair_distance=CROSSING_EVENT_PROXY_MAX_PAIR_DISTANCE,
+                    same_frame_tolerance_seconds=CROSSING_EVENT_PROXY_SAME_FRAME_TOLERANCE_SECONDS,
+                    max_mean_time_headway_seconds=MAX_MEAN_TIME_HEADWAY_SECONDS,
+                    max_p90_time_headway_seconds=MAX_P90_TIME_HEADWAY_SECONDS,
+                )
+                logger.info(
+                    f"{file_str}: traffic-control crossing proxy kept {episodes.height}/{raw_episode_count} "
+                    f"following episodes using classes={TRAFFIC_CONTROL_PROXY_CLASSES}, "
+                    f"buffer={CROSSING_EVENT_PROXY_FRAME_BUFFER_SECONDS}s, "
+                    f"max_pair_distance={CROSSING_EVENT_PROXY_MAX_PAIR_DISTANCE}, "
+                    f"max_mean_thw={MAX_MEAN_TIME_HEADWAY_SECONDS}s, "
+                    f"max_p90_thw={MAX_P90_TIME_HEADWAY_SECONDS}s, "
+                    f"min_detections={TRAFFIC_CONTROL_PROXY_MIN_DETECTIONS}."
+                )
 
             logger.info(str(episodes))
 

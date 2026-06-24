@@ -10,6 +10,12 @@ import polars as pl
 PERSON_CLASS = 0
 BICYCLE_CLASS = 1
 
+# COCO YOLO class ids used as a weak crossing proxy.
+# Change these in config if your detector uses a different label map.
+YOLO_TRAFFIC_LIGHT_CLASS = 9
+YOLO_STOP_SIGN_CLASS = 11
+TRAFFIC_CONTROL_PROXY_CLASS_IDS = [YOLO_TRAFFIC_LIGHT_CLASS, YOLO_STOP_SIGN_CLASS]
+
 
 @dataclass
 class FollowingParams:
@@ -46,6 +52,17 @@ class FollowingParams:
     # min_co_visible_seconds. Instead, include them in the output episodes so downstream
     # code can optionally annotate and save them separately.
     include_pairs_below_min_co_visible: bool = False
+
+    # Reviewer-aligned crossing-following gates.
+    # The geometry above detects generic trajectory following. These optional
+    # limits help remove cases where cyclists are merely platooning, are too far
+    # apart in time, or do not form a visible crossing-decision event.
+    # They are applied after episode construction, either inside
+    # detect_following_episodes for time-headway limits or by
+    # filter_following_episodes_by_traffic_control_proxy when the original YOLO
+    # rows are available.
+    max_mean_time_headway_seconds: Optional[float] = None
+    max_p90_time_headway_seconds: Optional[float] = None
     eps: float = 1e-9
 
 
@@ -324,9 +341,13 @@ class CyclistFollowing:
                 "mean_dir_cos": pl.Float64,
                 "mean_rel_speed": pl.Float64,
                 "mean_time_headway_frames": pl.Float64,
+                "p90_time_headway_frames": pl.Float64,
+                "max_time_headway_frames": pl.Float64,
             }
             if fps is not None and fps > 0:
                 schema["mean_time_headway_s"] = pl.Float64
+                schema["p90_time_headway_s"] = pl.Float64
+                schema["max_time_headway_s"] = pl.Float64
             if params.min_co_visible_seconds is not None and float(params.min_co_visible_seconds) > 0:
                 schema["co_visible_frames_total"] = pl.Int64
                 schema["meets_min_co_visible"] = pl.Boolean
@@ -606,6 +627,8 @@ class CyclistFollowing:
                                 "mean_dir_cos": float(np.mean(cos_g[seg_slice])),
                                 "mean_rel_speed": float(np.mean(relsp_g[seg_slice])),
                                 "mean_time_headway_frames": float(np.mean(thw_g[seg_slice])),
+                                "p90_time_headway_frames": float(np.percentile(thw_g[seg_slice], 90)),
+                                "max_time_headway_frames": float(np.max(thw_g[seg_slice])),
                             }
                         )
                     start = k
@@ -637,10 +660,290 @@ class CyclistFollowing:
                 )
         if fps is not None and fps > 0:
             ep = ep.with_columns(
-                (pl.col("mean_time_headway_frames") / float(fps)).alias("mean_time_headway_s")
+                [
+                    (pl.col("mean_time_headway_frames") / float(fps)).alias("mean_time_headway_s"),
+                    (pl.col("p90_time_headway_frames") / float(fps)).alias("p90_time_headway_s"),
+                    (pl.col("max_time_headway_frames") / float(fps)).alias("max_time_headway_s"),
+                ]
             )
 
+            # Remove large-delay cases such as a follower crossing much later
+            # than the leader. Reviewer feedback marked these as not meaningful
+            # crossing-following behaviour even when the geometry is aligned.
+            if params.max_mean_time_headway_seconds is not None and float(params.max_mean_time_headway_seconds) > 0:
+                ep = ep.filter(pl.col("mean_time_headway_s") <= float(params.max_mean_time_headway_seconds))
+            if params.max_p90_time_headway_seconds is not None and float(params.max_p90_time_headway_seconds) > 0:
+                ep = ep.filter(pl.col("p90_time_headway_s") <= float(params.max_p90_time_headway_seconds))
+        else:
+            if params.max_mean_time_headway_seconds is not None and float(params.max_mean_time_headway_seconds) > 0:
+                raise ValueError(
+                    "max_mean_time_headway_seconds is set but fps was not provided. "
+                    "Pass fps to detect_following_episodes so seconds can be converted to frames."
+                )
+            if params.max_p90_time_headway_seconds is not None and float(params.max_p90_time_headway_seconds) > 0:
+                raise ValueError(
+                    "max_p90_time_headway_seconds is set but fps was not provided. "
+                    "Pass fps to detect_following_episodes so seconds can be converted to frames."
+                )
+
         return ep
+
+
+    @staticmethod
+    def _empty_like_episodes_with_proxy_columns(episodes: pl.DataFrame) -> pl.DataFrame:
+        """Return an empty episodes frame while preserving episode columns.
+
+        The two proxy columns make downstream logging/exporting easier even when
+        no episode is kept by the traffic-control crossing proxy.
+        """
+        if episodes is None:
+            return pl.DataFrame(
+                schema={
+                    "traffic_control_proxy_count": pl.Int64,
+                    "traffic_control_proxy": pl.Boolean,
+                }
+            )
+
+        out = episodes.head(0)
+        if "traffic_control_proxy_count" not in out.columns:
+            out = out.with_columns(pl.lit(None).cast(pl.Int64).alias("traffic_control_proxy_count"))
+        if "traffic_control_proxy" not in out.columns:
+            out = out.with_columns(pl.lit(False).cast(pl.Boolean).alias("traffic_control_proxy"))
+        return out
+
+    @staticmethod
+    def traffic_control_proxy_rows(
+        df: pl.DataFrame,
+        *,
+        class_ids: Optional[list[int]] = None,
+        min_confidence: Optional[float] = None,
+    ) -> pl.DataFrame:
+        """Return traffic light / stop sign detections used as a crossing proxy.
+
+        This does not prove a cyclist is on a crossing. It only returns detections
+        of traffic-control objects that are often present near crossings or
+        intersections. The returned rows are later matched to following episode
+        frame intervals.
+        """
+        empty = pl.DataFrame(schema={"frame-count": pl.Int64, "yolo-id": pl.Int64})
+
+        if df is None or df.height == 0:
+            return empty
+
+        required_cols = {"frame-count", "yolo-id"}
+        if not required_cols.issubset(set(df.columns)):
+            return empty
+
+        wanted_class_ids = [int(x) for x in (class_ids or TRAFFIC_CONTROL_PROXY_CLASS_IDS)]
+        if not wanted_class_ids:
+            return empty
+
+        filter_expr = pl.col("yolo-id").cast(pl.Int64, strict=False).is_in(wanted_class_ids)
+
+        if min_confidence is not None and "confidence" in df.columns:
+            filter_expr = filter_expr & (pl.col("confidence").cast(pl.Float64, strict=False) >= float(min_confidence))
+
+        return df.filter(filter_expr)
+
+    @staticmethod
+    def filter_following_episodes_by_traffic_control_proxy(
+        *,
+        episodes: pl.DataFrame,
+        df: pl.DataFrame,
+        fps: Optional[float],
+        class_ids: Optional[list[int]] = None,
+        frame_buffer_seconds: float = 0.75,
+        min_detections: int = 1,
+        min_confidence: Optional[float] = None,
+        states: Optional[pl.DataFrame] = None,
+        max_pair_distance: Optional[float] = None,
+        same_frame_tolerance_seconds: float = 0.50,
+        max_mean_time_headway_seconds: Optional[float] = None,
+        max_p90_time_headway_seconds: Optional[float] = None,
+    ) -> pl.DataFrame:
+        """Keep only following episodes that look like visible crossing events.
+
+        Reviewer feedback showed that a weak temporal traffic-light / stop-sign
+        proxy is not enough: it lets ordinary platooning pass when a traffic
+        control object appears elsewhere in the segment. This filter therefore
+        applies three stricter, still YOLO-only gates:
+
+          1. A traffic-control proxy must be detected close in time to the
+             episode.
+          2. If states and max_pair_distance are supplied, the follower or
+             leader must also be spatially close to a traffic-control proxy.
+             This removes cases where the light/sign is visible in the frame
+             but unrelated to the cyclists' path.
+          3. Optional time-headway limits remove cases where the follower
+             crosses much later than the leader.
+
+        This is still a proxy; YOLO detections alone cannot prove that the
+        follower looked at the leader or made a dependent decision. It is meant
+        to reject clear non-crossing/platooning cases before sampling.
+        """
+        if episodes is None or episodes.height == 0:
+            return episodes
+
+        required_episode_cols = {"start_frame", "end_frame"}
+        if not required_episode_cols.issubset(set(episodes.columns)):
+            return episodes
+
+        proxy = CyclistFollowing.traffic_control_proxy_rows(
+            df,
+            class_ids=class_ids,
+            min_confidence=min_confidence,
+        )
+        if proxy.height == 0:
+            return CyclistFollowing._empty_like_episodes_with_proxy_columns(episodes)
+
+        proxy_cols = ["frame-count", "x-center", "y-center"]
+        has_proxy_xy = set(proxy_cols).issubset(set(proxy.columns))
+        proxy_frames = (
+            proxy
+            .select(pl.col("frame-count").cast(pl.Int64, strict=False).alias("proxy_frame"))
+            .filter(pl.col("proxy_frame").is_not_null())
+        )
+        if proxy_frames.height == 0:
+            return CyclistFollowing._empty_like_episodes_with_proxy_columns(episodes)
+
+        fps_value = float(fps or 0.0)
+        buffer_frames = 0
+        same_frame_tolerance = 0
+        if fps_value > 0:
+            buffer_frames = max(0, int(math.ceil(float(frame_buffer_seconds) * fps_value)))
+            same_frame_tolerance = max(0, int(math.ceil(float(same_frame_tolerance_seconds) * fps_value)))
+
+        min_hits = max(1, int(min_detections))
+        use_spatial_gate = (
+            states is not None
+            and states.height > 0
+            and max_pair_distance is not None
+            and float(max_pair_distance) > 0
+            and has_proxy_xy
+            and {"frame-count", "cyclist_id", "x", "y"}.issubset(set(states.columns))
+        )
+
+        def _min_pair_proxy_distance(row: dict, start_frame: int, end_frame: int) -> Optional[float]:
+            if not use_spatial_gate:
+                return None
+
+            try:
+                follower_id = int(row["follower_id"])
+                leader_id = int(row["leader_id"])
+            except Exception:
+                return None
+
+            pair_states = (
+                states  # type: ignore[union-attr]
+                .filter(
+                    (pl.col("cyclist_id").cast(pl.Int64, strict=False).is_in([follower_id, leader_id]))
+                    & (pl.col("frame-count").cast(pl.Int64, strict=False) >= int(start_frame))
+                    & (pl.col("frame-count").cast(pl.Int64, strict=False) <= int(end_frame))
+                )
+                .select(
+                    [
+                        pl.col("frame-count").cast(pl.Int64, strict=False).alias("frame"),
+                        pl.col("x").cast(pl.Float64, strict=False).alias("x"),
+                        pl.col("y").cast(pl.Float64, strict=False).alias("y"),
+                    ]
+                )
+                .filter(pl.col("frame").is_not_null() & pl.col("x").is_not_null() & pl.col("y").is_not_null())
+            )
+            if pair_states.height == 0:
+                return None
+
+            proxy_points = (
+                proxy
+                .filter(
+                    (pl.col("frame-count").cast(pl.Int64, strict=False) >= int(start_frame - same_frame_tolerance))
+                    & (pl.col("frame-count").cast(pl.Int64, strict=False) <= int(end_frame + same_frame_tolerance))
+                )
+                .select(
+                    [
+                        pl.col("frame-count").cast(pl.Int64, strict=False).alias("frame"),
+                        pl.col("x-center").cast(pl.Float64, strict=False).alias("x"),
+                        pl.col("y-center").cast(pl.Float64, strict=False).alias("y"),
+                    ]
+                )
+                .filter(pl.col("frame").is_not_null() & pl.col("x").is_not_null() & pl.col("y").is_not_null())
+            )
+            if proxy_points.height == 0:
+                return None
+
+            state_rows = pair_states.rows()
+            proxy_rows = proxy_points.rows()
+            best: Optional[float] = None
+            for sf, sx, sy in state_rows:
+                for pf, px, py in proxy_rows:
+                    if abs(int(sf) - int(pf)) > int(same_frame_tolerance):
+                        continue
+                    d = math.sqrt((float(sx) - float(px)) ** 2 + (float(sy) - float(py)) ** 2)
+                    if best is None or d < best:
+                        best = d
+            return best
+
+        keep_rows: list[dict] = []
+
+        for row in episodes.iter_rows(named=True):
+            try:
+                episode_start = int(row["start_frame"])
+                episode_end = int(row["end_frame"])
+                start_frame = episode_start - int(buffer_frames)
+                end_frame = episode_end + int(buffer_frames)
+            except Exception:
+                continue
+
+            if max_mean_time_headway_seconds is not None and float(max_mean_time_headway_seconds) > 0:
+                value = row.get("mean_time_headway_s")
+                if value is None:
+                    if fps_value <= 0 or row.get("mean_time_headway_frames") is None:
+                        continue
+                    value = float(row["mean_time_headway_frames"]) / fps_value
+                if float(value) > float(max_mean_time_headway_seconds):
+                    continue
+
+            if max_p90_time_headway_seconds is not None and float(max_p90_time_headway_seconds) > 0:
+                value = row.get("p90_time_headway_s")
+                if value is None:
+                    if fps_value <= 0 or row.get("p90_time_headway_frames") is None:
+                        continue
+                    value = float(row["p90_time_headway_frames"]) / fps_value
+                if float(value) > float(max_p90_time_headway_seconds):
+                    continue
+
+            n_hits = int(
+                proxy_frames
+                .filter(
+                    (pl.col("proxy_frame") >= int(start_frame))
+                    & (pl.col("proxy_frame") <= int(end_frame))
+                )
+                .height
+            )
+
+            if n_hits < min_hits:
+                continue
+
+            min_pair_distance = _min_pair_proxy_distance(row, episode_start, episode_end)
+            if use_spatial_gate:
+                if min_pair_distance is None:
+                    continue
+                if float(min_pair_distance) > float(max_pair_distance):
+                    continue
+
+            out_row = dict(row)
+            out_row["traffic_control_proxy_count"] = int(n_hits)
+            out_row["traffic_control_proxy"] = True
+            if min_pair_distance is not None:
+                out_row["traffic_control_pair_min_distance"] = float(min_pair_distance)
+            keep_rows.append(out_row)
+
+        if not keep_rows:
+            out = CyclistFollowing._empty_like_episodes_with_proxy_columns(episodes)
+            if "traffic_control_pair_min_distance" not in out.columns:
+                out = out.with_columns(pl.lit(None).cast(pl.Float64).alias("traffic_control_pair_min_distance"))
+            return out
+
+        return pl.DataFrame(keep_rows)
 
     @staticmethod
     def summarize_following_pairs(
